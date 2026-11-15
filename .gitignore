@@ -7,3 +7,5 @@ server/data/*.db-wal
 server/data/*.db-shm
 .env
 *.log
+.neon
+.env.local

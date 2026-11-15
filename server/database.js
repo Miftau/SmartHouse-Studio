@@ -1,472 +1,309 @@
-const { DatabaseSync } = require('node:sqlite');
-const fs = require('fs');
-const path = require('path');
+const { Pool } = require('pg');
+const neonEnv = require('./neonEnv');
+const { runMigrations } = require('./migrate');
 const { hashPassword, generateToken } = require('./security');
 
-const DATA_DIR = process.env.DATA_DIR
-  ? path.resolve(process.env.DATA_DIR)
-  : path.join(__dirname, 'data');
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+const pool = new Pool({
+  connectionString: neonEnv.databaseUrl,
+  allowExitOnIdle: true
+});
+
+let initPromise = null;
+
+async function ensureInitialized() {
+  if (!initPromise) {
+    initPromise = (async () => {
+      await runMigrations();
+
+      const { rows } = await pool.query('SELECT COUNT(*)::int AS cnt FROM admin_users');
+      const count = rows[0]?.cnt ?? 0;
+      if (count === 0) {
+        const defaultUsername = (process.env.ADMIN_USERNAME || 'admin').trim();
+        const defaultPassword = process.env.ADMIN_PASSWORD || 'SmartHouse@2026';
+        const { hash, salt } = hashPassword(defaultPassword);
+        await pool.query(
+          `INSERT INTO admin_users (username, password_hash, salt, must_change_password, updated_at)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (username) DO NOTHING`,
+          [
+            defaultUsername,
+            hash,
+            salt,
+            process.env.ADMIN_PASSWORD ? 0 : 1,
+            new Date().toISOString()
+          ]
+        );
+        console.log(
+          `[Auth] Seeded initial admin user "${defaultUsername}".${process.env.ADMIN_PASSWORD ? '' : ' Change default password after first login.'}`
+        );
+      }
+    })().catch(err => {
+      initPromise = null;
+      throw err;
+    });
+  }
+  return initPromise;
 }
 
-const DB_PATH = path.join(DATA_DIR, 'smart_house.db');
-const db = new DatabaseSync(DB_PATH);
-
-// Initialize schema with WAL mode & foreign key enforcement
-db.exec(`
-  PRAGMA journal_mode = WAL;
-  PRAGMA foreign_keys = ON;
-
-  CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
-    config_hash TEXT NOT NULL,
-    config_snapshot TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'active',
-    timezone TEXT NOT NULL DEFAULT 'UTC',
-    started_at TEXT NOT NULL,
-    ended_at TEXT,
-    strict_session_lock INTEGER NOT NULL DEFAULT 0
-  );
-
-  CREATE TABLE IF NOT EXISTS annotations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    client_uuid TEXT UNIQUE NOT NULL,
-    session_id TEXT NOT NULL,
-    participant TEXT NOT NULL,
-    seq INTEGER NOT NULL,
-    timestamp_started TEXT NOT NULL,
-    timestamp_submitted TEXT NOT NULL,
-    timestamp_received TEXT NOT NULL,
-    location_id INTEGER NOT NULL,
-    location TEXT NOT NULL,
-    activity_id INTEGER NOT NULL,
-    activity TEXT NOT NULL,
-    interaction TEXT NOT NULL,
-    other_person TEXT,
-    edited INTEGER NOT NULL DEFAULT 0,
-    config_version TEXT NOT NULL,
-    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_annotations_session_participant ON annotations(session_id, participant);
-  CREATE INDEX IF NOT EXISTS idx_annotations_ts ON annotations(timestamp_submitted);
-
-  CREATE TABLE IF NOT EXISTS wearables (
-    device_id TEXT PRIMARY KEY,
-    session_id TEXT,
-    participant TEXT,
-    device_name TEXT,
-    device_family TEXT,
-    battery_level INTEGER DEFAULT 100,
-    last_seen TEXT,
-    status TEXT DEFAULT 'connected'
-  );
-
-  CREATE TABLE IF NOT EXISTS sensor_chunks (
-    chunk_uuid TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    participant TEXT NOT NULL,
-    device_id TEXT,
-    stream_type TEXT NOT NULL,
-    sample_count INTEGER NOT NULL,
-    ts_first_device INTEGER,
-    ts_last_device INTEGER,
-    ts_received TEXT NOT NULL,
-    payload TEXT,
-    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_chunks_session ON sensor_chunks(session_id, participant);
-
-  CREATE TABLE IF NOT EXISTS sync_points (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL,
-    participant TEXT NOT NULL,
-    device_id TEXT,
-    client_now INTEGER,
-    server_now INTEGER,
-    offset_ms REAL,
-    rtt_ms REAL,
-    created_at TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS collaborator_locks (
-    session_id TEXT NOT NULL,
-    taken_person TEXT NOT NULL,
-    taken_by TEXT NOT NULL,
-    activity TEXT,
-    locked_at TEXT NOT NULL,
-    PRIMARY KEY (session_id, taken_person),
-    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS admin_users (
-    username TEXT PRIMARY KEY,
-    password_hash TEXT NOT NULL,
-    salt TEXT NOT NULL,
-    must_change_password INTEGER NOT NULL DEFAULT 1,
-    updated_at TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS admin_sessions (
-    token_hash TEXT PRIMARY KEY,
-    username TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    FOREIGN KEY(username) REFERENCES admin_users(username) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS participant_tokens (
-    token TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    participant TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    UNIQUE(session_id, participant),
-    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS environments (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    description TEXT NOT NULL DEFAULT '',
-    config_hash TEXT NOT NULL,
-    config_snapshot TEXT NOT NULL,
-    is_default INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  );
-`);
-
-// Safe migrations for pre-existing databases
-try {
-  db.exec('ALTER TABLE sessions ADD COLUMN strict_session_lock INTEGER NOT NULL DEFAULT 0');
-} catch {
-  // Column already exists
+function mapEnvironmentRow(row) {
+  if (!row) return null;
+  let snapshot = null;
+  try {
+    snapshot = JSON.parse(row.config_snapshot);
+  } catch {
+    snapshot = null;
+  }
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    config_hash: row.config_hash,
+    is_default: Boolean(row.is_default),
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    snapshot
+  };
 }
-try {
-  db.exec("ALTER TABLE sessions ADD COLUMN environment_id TEXT DEFAULT 'default-smart-house'");
-} catch {
-  // Column already exists
-}
-try {
-  db.exec("ALTER TABLE sessions ADD COLUMN environment_name TEXT DEFAULT 'Default Smart House'");
-} catch {
-  // Column already exists
-}
-
-// Seed default researcher admin account on first boot if none exists
-const adminCountRow = db.prepare('SELECT COUNT(*) AS cnt FROM admin_users').get();
-if (!adminCountRow || adminCountRow.cnt === 0) {
-  const defaultUsername = (process.env.ADMIN_USERNAME || 'admin').trim();
-  const defaultPassword = process.env.ADMIN_PASSWORD || 'SmartHouse@2026';
-  const { hash, salt } = hashPassword(defaultPassword);
-  db.prepare(`
-    INSERT INTO admin_users (username, password_hash, salt, must_change_password, updated_at)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(
-    defaultUsername,
-    hash,
-    salt,
-    process.env.ADMIN_PASSWORD ? 0 : 1,
-    new Date().toISOString()
-  );
-  console.log(`[Auth] Seeded initial admin user "${defaultUsername}".${process.env.ADMIN_PASSWORD ? '' : ' Change default password after first login.'}`);
-}
-
-// Prepared statement caches
-const stmtGetSession = db.prepare('SELECT * FROM sessions WHERE id = ?');
-const stmtListSessions = db.prepare('SELECT id, config_hash, status, timezone, started_at, ended_at, strict_session_lock, environment_id, environment_name FROM sessions ORDER BY started_at DESC');
-const stmtCreateSession = db.prepare(`
-  INSERT INTO sessions (id, config_hash, config_snapshot, status, timezone, started_at, environment_id, environment_name)
-  VALUES (?, ?, ?, 'active', ?, ?, ?, ?)
-`);
-
-const stmtListEnvironments = db.prepare('SELECT id, name, description, config_hash, config_snapshot, is_default, created_at, updated_at FROM environments ORDER BY is_default DESC, created_at DESC');
-const stmtGetEnvironment = db.prepare('SELECT * FROM environments WHERE id = ?');
-const stmtUpsertDefaultEnvironment = db.prepare(`
-  INSERT INTO environments (id, name, description, config_hash, config_snapshot, is_default, created_at, updated_at)
-  VALUES (?, ?, ?, ?, ?, 1, ?, ?)
-  ON CONFLICT(id) DO UPDATE SET
-    config_hash = excluded.config_hash,
-    config_snapshot = excluded.config_snapshot,
-    updated_at = excluded.updated_at
-`);
-const stmtInsertEnvironment = db.prepare(`
-  INSERT INTO environments (id, name, description, config_hash, config_snapshot, is_default, created_at, updated_at)
-  VALUES (?, ?, ?, ?, ?, 0, ?, ?)
-`);
-const stmtDeleteEnvironment = db.prepare('DELETE FROM environments WHERE id = ? AND is_default = 0');
-const stmtStartSession = db.prepare(`
-  UPDATE sessions 
-  SET status = 'active', 
-      ended_at = NULL 
-  WHERE id = ?
-`);
-const stmtStopSession = db.prepare(`
-  UPDATE sessions 
-  SET status = 'stopped', 
-      ended_at = ? 
-  WHERE id = ?
-`);
-const stmtDeleteSession = db.prepare('DELETE FROM sessions WHERE id = ?');
-const stmtDeleteAnnotationsForSession = db.prepare('DELETE FROM annotations WHERE session_id = ?');
-const stmtDeleteChunksForSession = db.prepare('DELETE FROM sensor_chunks WHERE session_id = ?');
-const stmtDeleteLocksForSession = db.prepare('DELETE FROM collaborator_locks WHERE session_id = ?');
-const stmtDeleteWearablesForSession = db.prepare('DELETE FROM wearables WHERE session_id = ?');
-const stmtDeleteSyncPointsForSession = db.prepare('DELETE FROM sync_points WHERE session_id = ?');
-const stmtDeleteTokensForSession = db.prepare('DELETE FROM participant_tokens WHERE session_id = ?');
-const stmtSetLockPolicy = db.prepare('UPDATE sessions SET strict_session_lock = ? WHERE id = ?');
-
-const stmtGetAdminUser = db.prepare('SELECT * FROM admin_users WHERE username = ?');
-const stmtUpdateAdminPassword = db.prepare(`
-  UPDATE admin_users
-  SET password_hash = ?, salt = ?, must_change_password = 0, updated_at = ?
-  WHERE username = ?
-`);
-const stmtInsertAdminSession = db.prepare(`
-  INSERT INTO admin_sessions (token_hash, username, expires_at, created_at)
-  VALUES (?, ?, ?, ?)
-`);
-const stmtGetAdminSession = db.prepare('SELECT * FROM admin_sessions WHERE token_hash = ?');
-const stmtDeleteAdminSession = db.prepare('DELETE FROM admin_sessions WHERE token_hash = ?');
-const stmtDeleteExpiredAdminSessions = db.prepare('DELETE FROM admin_sessions WHERE expires_at <= ?');
-
-const stmtGetParticipantToken = db.prepare('SELECT * FROM participant_tokens WHERE token = ?');
-const stmtListSessionParticipantTokens = db.prepare('SELECT * FROM participant_tokens WHERE session_id = ?');
-const stmtInsertParticipantToken = db.prepare(`
-  INSERT OR IGNORE INTO participant_tokens (token, session_id, participant, created_at)
-  VALUES (?, ?, ?, ?)
-`);
-
-const stmtGetSessionLocks = db.prepare('SELECT * FROM collaborator_locks WHERE session_id = ?');
-const stmtGetLockForPerson = db.prepare('SELECT * FROM collaborator_locks WHERE session_id = ? AND taken_person = ?');
-const stmtUpsertLock = db.prepare(`
-  INSERT INTO collaborator_locks (session_id, taken_person, taken_by, activity, locked_at)
-  VALUES (?, ?, ?, ?, ?)
-  ON CONFLICT(session_id, taken_person) DO UPDATE SET
-    taken_by = excluded.taken_by,
-    activity = excluded.activity,
-    locked_at = excluded.locked_at
-`);
-const stmtDeleteLockForPerson = db.prepare('DELETE FROM collaborator_locks WHERE session_id = ? AND taken_person = ?');
-const stmtDeleteLocksTakenBy = db.prepare('DELETE FROM collaborator_locks WHERE session_id = ? AND taken_by = ?');
-
-const stmtGetNextSeq = db.prepare(`
-  SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq
-  FROM annotations
-  WHERE session_id = ? AND participant = ?
-`);
-
-const stmtInsertAnnotation = db.prepare(`
-  INSERT INTO annotations (
-    client_uuid, session_id, participant, seq,
-    timestamp_started, timestamp_submitted, timestamp_received,
-    location_id, location, activity_id, activity,
-    interaction, other_person, edited, config_version
-  ) VALUES (
-    ?, ?, ?, ?,
-    ?, ?, ?,
-    ?, ?, ?, ?,
-    ?, ?, ?, ?
-  )
-`);
-
-const stmtGetAnnotationByClientUuid = db.prepare('SELECT * FROM annotations WHERE client_uuid = ?');
-
-const stmtGetAnnotationsForSession = db.prepare(`
-  SELECT * FROM annotations
-  WHERE session_id = ?
-  ORDER BY timestamp_submitted ASC, participant ASC
-`);
-
-const stmtGetAnnotationsForParticipant = db.prepare(`
-  SELECT * FROM annotations
-  WHERE session_id = ? AND participant = ?
-  ORDER BY timestamp_submitted ASC
-`);
-
-const stmtInsertChunk = db.prepare(`
-  INSERT OR IGNORE INTO sensor_chunks (
-    chunk_uuid, session_id, participant, device_id,
-    stream_type, sample_count, ts_first_device, ts_last_device,
-    ts_received, payload
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-`);
-
-const stmtUpsertWearable = db.prepare(`
-  INSERT INTO wearables (device_id, session_id, participant, device_name, device_family, battery_level, last_seen, status)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  ON CONFLICT(device_id) DO UPDATE SET
-    session_id = excluded.session_id,
-    participant = excluded.participant,
-    device_name = excluded.device_name,
-    battery_level = excluded.battery_level,
-    last_seen = excluded.last_seen,
-    status = excluded.status
-`);
-
-const stmtListWearables = db.prepare('SELECT * FROM wearables ORDER BY last_seen DESC');
-
-const stmtSessionSummary = db.prepare(`
-  SELECT 
-    s.id,
-    s.status,
-    s.timezone,
-    s.started_at,
-    s.ended_at,
-    s.config_hash,
-    COALESCE(s.environment_id, 'default-smart-house') AS environment_id,
-    COALESCE(s.environment_name, 'Default Smart House') AS environment_name,
-    (SELECT COUNT(*) FROM annotations a WHERE a.session_id = s.id) AS annotation_count,
-    (SELECT COUNT(*) FROM sensor_chunks c WHERE c.session_id = s.id) AS chunk_count,
-    (SELECT GROUP_CONCAT(DISTINCT a.participant) FROM annotations a WHERE a.session_id = s.id) AS active_participants
-  FROM sessions s
-  ORDER BY s.started_at DESC
-`);
 
 module.exports = {
-  db,
-  ensureDefaultEnvironment(configHash, configSnapshot) {
+  pool,
+  init: ensureInitialized,
+
+  async ensureDefaultEnvironment(configHash, configSnapshot) {
+    await ensureInitialized();
     const now = new Date().toISOString();
-    stmtUpsertDefaultEnvironment.run(
-      'default-smart-house',
-      'Default Smart House',
-      'Built-in PRD Smart House configuration (3 residents, 11 rooms)',
-      configHash,
-      JSON.stringify(configSnapshot),
-      now,
-      now
+    const { rows } = await pool.query(
+      `INSERT INTO environments (id, name, description, config_hash, config_snapshot, is_default, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, 1, $6, $7)
+       ON CONFLICT (id) DO UPDATE SET
+         config_hash = EXCLUDED.config_hash,
+         config_snapshot = EXCLUDED.config_snapshot,
+         updated_at = EXCLUDED.updated_at
+       RETURNING *`,
+      [
+        'default-smart-house',
+        'Default Smart House',
+        'Built-in PRD Smart House configuration (3 residents, 11 rooms)',
+        configHash,
+        JSON.stringify(configSnapshot),
+        now,
+        now
+      ]
     );
-    return stmtGetEnvironment.get('default-smart-house');
+    return rows[0] || null;
   },
-  listEnvironments() {
-    return stmtListEnvironments.all().map(row => {
-      let snapshot = null;
-      try {
-        snapshot = JSON.parse(row.config_snapshot);
-      } catch {
-        snapshot = null;
-      }
-      return {
-        id: row.id,
-        name: row.name,
-        description: row.description,
-        config_hash: row.config_hash,
-        is_default: Boolean(row.is_default),
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        snapshot
-      };
-    });
+
+  async listEnvironments() {
+    await ensureInitialized();
+    const { rows } = await pool.query(
+      `SELECT id, name, description, config_hash, config_snapshot, is_default, created_at, updated_at
+       FROM environments
+       ORDER BY is_default DESC, created_at DESC`
+    );
+    return rows.map(mapEnvironmentRow);
   },
-  getEnvironment(id) {
-    const row = stmtGetEnvironment.get(id);
-    if (!row) return null;
-    let snapshot = null;
-    try {
-      snapshot = JSON.parse(row.config_snapshot);
-    } catch {
-      snapshot = null;
-    }
-    return {
-      id: row.id,
-      name: row.name,
-      description: row.description,
-      config_hash: row.config_hash,
-      is_default: Boolean(row.is_default),
-      created_at: row.created_at,
-      updated_at: row.updated_at,
-      snapshot
-    };
+
+  async getEnvironment(id) {
+    await ensureInitialized();
+    const { rows } = await pool.query('SELECT * FROM environments WHERE id = $1', [id]);
+    return mapEnvironmentRow(rows[0]);
   },
-  createEnvironment({ id, name, description = '', configHash, configSnapshot }) {
+
+  async createEnvironment({ id, name, description = '', configHash, configSnapshot }) {
+    await ensureInitialized();
     const now = new Date().toISOString();
-    stmtInsertEnvironment.run(id, name, description, configHash, JSON.stringify(configSnapshot), now, now);
-    return this.getEnvironment(id);
+    const { rows } = await pool.query(
+      `INSERT INTO environments (id, name, description, config_hash, config_snapshot, is_default, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, 0, $6, $7)
+       RETURNING *`,
+      [id, name, description, configHash, JSON.stringify(configSnapshot), now, now]
+    );
+    return mapEnvironmentRow(rows[0]);
   },
-  deleteEnvironment(id) {
-    const info = stmtDeleteEnvironment.run(id);
-    return { deleted: info.changes > 0, id };
+
+  async deleteEnvironment(id) {
+    await ensureInitialized();
+    const res = await pool.query('DELETE FROM environments WHERE id = $1 AND is_default = 0', [id]);
+    return { deleted: (res.rowCount || 0) > 0, id };
   },
-  getSession(id) {
-    return stmtGetSession.get(id);
+
+  async getSession(id) {
+    await ensureInitialized();
+    const { rows } = await pool.query('SELECT * FROM sessions WHERE id = $1', [id]);
+    return rows[0] || null;
   },
-  listSessions() {
-    return stmtListSessions.all();
+
+  async listSessions() {
+    await ensureInitialized();
+    const { rows } = await pool.query(
+      `SELECT id, config_hash, status, timezone, started_at, ended_at, strict_session_lock, environment_id, environment_name
+       FROM sessions
+       ORDER BY started_at DESC`
+    );
+    return rows;
   },
-  getSessionSummaries() {
-    return stmtSessionSummary.all();
+
+  async getSessionSummaries() {
+    await ensureInitialized();
+    const { rows } = await pool.query(
+      `SELECT
+         s.id,
+         s.status,
+         s.timezone,
+         s.started_at,
+         s.ended_at,
+         s.config_hash,
+         COALESCE(s.environment_id, 'default-smart-house') AS environment_id,
+         COALESCE(s.environment_name, 'Default Smart House') AS environment_name,
+         (SELECT COUNT(*)::int FROM annotations a WHERE a.session_id = s.id) AS annotation_count,
+         (SELECT COUNT(*)::int FROM sensor_chunks c WHERE c.session_id = s.id) AS chunk_count,
+         (SELECT STRING_AGG(DISTINCT a.participant, ',') FROM annotations a WHERE a.session_id = s.id) AS active_participants
+       FROM sessions s
+       ORDER BY s.started_at DESC`
+    );
+    return rows;
   },
-  createSession(id, configHash, configSnapshot, timezone = 'Europe/Paris', environmentId = 'default-smart-house', environmentName = 'Default Smart House') {
+
+  async createSession(
+    id,
+    configHash,
+    configSnapshot,
+    timezone = 'Europe/Paris',
+    environmentId = 'default-smart-house',
+    environmentName = 'Default Smart House'
+  ) {
+    await ensureInitialized();
     const startedAt = new Date().toISOString();
-    stmtCreateSession.run(id, configHash, JSON.stringify(configSnapshot), timezone, startedAt, environmentId, environmentName);
-    return stmtGetSession.get(id);
+    const { rows } = await pool.query(
+      `INSERT INTO sessions (id, config_hash, config_snapshot, status, timezone, started_at, environment_id, environment_name)
+       VALUES ($1, $2, $3, 'active', $4, $5, $6, $7)
+       RETURNING *`,
+      [id, configHash, JSON.stringify(configSnapshot), timezone, startedAt, environmentId, environmentName]
+    );
+    return rows[0] || null;
   },
-  startSession(id) {
-    stmtStartSession.run(id);
-    return stmtGetSession.get(id);
+
+  async startSession(id) {
+    await ensureInitialized();
+    const { rows } = await pool.query(
+      `UPDATE sessions
+       SET status = 'active', ended_at = NULL
+       WHERE id = $1
+       RETURNING *`,
+      [id]
+    );
+    return rows[0] || null;
   },
-  stopSession(id) {
+
+  async stopSession(id) {
+    await ensureInitialized();
     const endedAt = new Date().toISOString();
-    stmtStopSession.run(endedAt, id);
-    return stmtGetSession.get(id);
+    const { rows } = await pool.query(
+      `UPDATE sessions
+       SET status = 'stopped', ended_at = $1
+       WHERE id = $2
+       RETURNING *`,
+      [endedAt, id]
+    );
+    return rows[0] || null;
   },
-  endSession(id) {
+
+  async endSession(id) {
     return this.stopSession(id);
   },
-  deleteSession(id) {
-    db.exec('BEGIN IMMEDIATE');
+
+  async deleteSession(id) {
+    await ensureInitialized();
+    const client = await pool.connect();
     try {
-      stmtDeleteTokensForSession.run(id);
-      stmtDeleteLocksForSession.run(id);
-      stmtDeleteAnnotationsForSession.run(id);
-      stmtDeleteChunksForSession.run(id);
-      stmtDeleteWearablesForSession.run(id);
-      stmtDeleteSyncPointsForSession.run(id);
-      stmtDeleteSession.run(id);
-      db.exec('COMMIT');
+      await client.query('BEGIN');
+      await client.query('DELETE FROM participant_tokens WHERE session_id = $1', [id]);
+      await client.query('DELETE FROM collaborator_locks WHERE session_id = $1', [id]);
+      await client.query('DELETE FROM annotations WHERE session_id = $1', [id]);
+      await client.query('DELETE FROM sensor_chunks WHERE session_id = $1', [id]);
+      await client.query('DELETE FROM wearables WHERE session_id = $1', [id]);
+      await client.query('DELETE FROM sync_points WHERE session_id = $1', [id]);
+      await client.query('DELETE FROM sessions WHERE id = $1', [id]);
+      await client.query('COMMIT');
     } catch (err) {
-      db.exec('ROLLBACK');
+      await client.query('ROLLBACK').catch(() => {});
       throw err;
+    } finally {
+      client.release();
     }
     return { success: true, id };
   },
-  setSessionLockPolicy(sessionId, strict) {
-    stmtSetLockPolicy.run(strict ? 1 : 0, sessionId);
-    const updated = stmtGetSession.get(sessionId);
-    return updated ? Boolean(updated.strict_session_lock) : false;
+
+  async setSessionLockPolicy(sessionId, strict) {
+    await ensureInitialized();
+    const { rows } = await pool.query(
+      `UPDATE sessions
+       SET strict_session_lock = $1
+       WHERE id = $2
+       RETURNING strict_session_lock`,
+      [strict ? 1 : 0, sessionId]
+    );
+    return rows[0] ? Boolean(rows[0].strict_session_lock) : false;
   },
-  getAdminUser(username) {
-    return stmtGetAdminUser.get(username);
+
+  async getAdminUser(username) {
+    await ensureInitialized();
+    const { rows } = await pool.query('SELECT * FROM admin_users WHERE username = $1', [username]);
+    return rows[0] || null;
   },
-  updateAdminPassword(username, hash, salt) {
-    stmtUpdateAdminPassword.run(hash, salt, new Date().toISOString(), username);
-    return stmtGetAdminUser.get(username);
+
+  async updateAdminPassword(username, hash, salt) {
+    await ensureInitialized();
+    const { rows } = await pool.query(
+      `UPDATE admin_users
+       SET password_hash = $1, salt = $2, must_change_password = 0, updated_at = $3
+       WHERE username = $4
+       RETURNING *`,
+      [hash, salt, new Date().toISOString(), username]
+    );
+    return rows[0] || null;
   },
-  createAdminSession(tokenHash, username, ttlMs) {
+
+  async createAdminSession(tokenHash, username, ttlMs) {
+    await ensureInitialized();
     const now = Date.now();
-    stmtDeleteExpiredAdminSessions.run(new Date(now).toISOString());
     const createdAt = new Date(now).toISOString();
     const expiresAt = new Date(now + ttlMs).toISOString();
-    stmtInsertAdminSession.run(tokenHash, username, expiresAt, createdAt);
+    await pool.query('DELETE FROM admin_sessions WHERE expires_at <= $1', [createdAt]);
+    await pool.query(
+      `INSERT INTO admin_sessions (token_hash, username, expires_at, created_at)
+       VALUES ($1, $2, $3, $4)`,
+      [tokenHash, username, expiresAt, createdAt]
+    );
     return { tokenHash, username, expiresAt };
   },
-  getAdminSession(tokenHash) {
+
+  async getAdminSession(tokenHash) {
+    await ensureInitialized();
     if (!tokenHash) return null;
-    const row = stmtGetAdminSession.get(tokenHash);
+    const { rows } = await pool.query('SELECT * FROM admin_sessions WHERE token_hash = $1', [tokenHash]);
+    const row = rows[0];
     if (!row) return null;
     if (Date.parse(row.expires_at) <= Date.now()) {
-      stmtDeleteAdminSession.run(tokenHash);
+      await pool.query('DELETE FROM admin_sessions WHERE token_hash = $1', [tokenHash]);
       return null;
     }
     return row;
   },
-  deleteAdminSession(tokenHash) {
-    if (tokenHash) stmtDeleteAdminSession.run(tokenHash);
+
+  async deleteAdminSession(tokenHash) {
+    await ensureInitialized();
+    if (tokenHash) {
+      await pool.query('DELETE FROM admin_sessions WHERE token_hash = $1', [tokenHash]);
+    }
   },
-  ensureParticipantTokens(sessionId, roles) {
-    const existing = stmtListSessionParticipantTokens.all(sessionId);
+
+  async ensureParticipantTokens(sessionId, roles) {
+    await ensureInitialized();
+    const { rows: existing } = await pool.query(
+      'SELECT * FROM participant_tokens WHERE session_id = $1',
+      [sessionId]
+    );
     const byRole = {};
     for (const row of existing) {
       byRole[row.participant] = row.token;
@@ -475,54 +312,87 @@ module.exports = {
     for (const role of roles) {
       if (!byRole[role]) {
         const tok = generateToken(24);
-        stmtInsertParticipantToken.run(tok, sessionId, role, now);
+        await pool.query(
+          `INSERT INTO participant_tokens (token, session_id, participant, created_at)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (session_id, participant) DO NOTHING`,
+          [tok, sessionId, role, now]
+        );
         byRole[role] = tok;
       }
     }
-    // Re-read in case of concurrent insert
-    const finalRows = stmtListSessionParticipantTokens.all(sessionId);
+    const { rows: finalRows } = await pool.query(
+      'SELECT * FROM participant_tokens WHERE session_id = $1',
+      [sessionId]
+    );
     const result = {};
     for (const row of finalRows) {
       result[row.participant] = row.token;
     }
     return result;
   },
-  getParticipantToken(token) {
+
+  async getParticipantToken(token) {
+    await ensureInitialized();
     if (!token || typeof token !== 'string') return null;
-    return stmtGetParticipantToken.get(token.trim()) || null;
+    const { rows } = await pool.query(
+      'SELECT * FROM participant_tokens WHERE token = $1',
+      [token.trim()]
+    );
+    return rows[0] || null;
   },
-  getSessionLocks(_sessionId) {
+
+  async getSessionLocks(_sessionId) {
+    await ensureInitialized();
     return [];
   },
-  releaseLock(sessionId, takenPerson) {
-    stmtDeleteLockForPerson.run(sessionId, takenPerson);
+
+  async releaseLock(sessionId, takenPerson) {
+    await ensureInitialized();
+    await pool.query(
+      'DELETE FROM collaborator_locks WHERE session_id = $1 AND taken_person = $2',
+      [sessionId, takenPerson]
+    );
     return [];
   },
-  releaseAllLocks(sessionId) {
-    stmtDeleteLocksForSession.run(sessionId);
+
+  async releaseAllLocks(sessionId) {
+    await ensureInitialized();
+    await pool.query('DELETE FROM collaborator_locks WHERE session_id = $1', [sessionId]);
     return [];
   },
-  saveAnnotation(data) {
-    db.exec('BEGIN IMMEDIATE');
+
+  async saveAnnotation(data) {
+    await ensureInitialized();
+    const client = await pool.connect();
     try {
-      // Verify session is active
-      const session = stmtGetSession.get(data.session_id);
+      await client.query('BEGIN');
+
+      const { rows: sessionRows } = await client.query(
+        'SELECT * FROM sessions WHERE id = $1 FOR UPDATE',
+        [data.session_id]
+      );
+      const session = sessionRows[0];
       if (!session) {
         const err = new Error(`Session "${data.session_id}" does not exist.`);
         err.statusCode = 404;
         throw err;
       }
       if (session.status !== 'active') {
-        const err = new Error(`Session "${data.session_id}" is currently ${session.status.toUpperCase()}. Annotations cannot be submitted while the session is stopped.`);
+        const err = new Error(
+          `Session "${data.session_id}" is currently ${session.status.toUpperCase()}. Annotations cannot be submitted while the session is stopped.`
+        );
         err.statusCode = 409;
         throw err;
       }
 
-      // Check if already stored (idempotent submission)
-      const existing = stmtGetAnnotationByClientUuid.get(data.client_uuid);
-      if (existing) {
-        db.exec('COMMIT');
-        return { row: existing, isDuplicate: true };
+      const { rows: existingRows } = await client.query(
+        'SELECT * FROM annotations WHERE client_uuid = $1',
+        [data.client_uuid]
+      );
+      if (existingRows[0]) {
+        await client.query('COMMIT');
+        return { row: existingRows[0], isDuplicate: true };
       }
 
       const otherPerson = data.other_person ? String(data.other_person).trim() : '';
@@ -532,72 +402,129 @@ module.exports = {
         throw err;
       }
 
-      const nextSeq = stmtGetNextSeq.get(data.session_id, data.participant).next_seq;
+      const { rows: seqRows } = await client.query(
+        `SELECT (COALESCE(MAX(seq), 0) + 1)::int AS next_seq
+         FROM annotations
+         WHERE session_id = $1 AND participant = $2`,
+        [data.session_id, data.participant]
+      );
+      const nextSeq = seqRows[0].next_seq;
       const tsReceived = new Date().toISOString();
 
-      stmtInsertAnnotation.run(
-        data.client_uuid,
-        data.session_id,
-        data.participant,
-        nextSeq,
-        data.timestamp_started,
-        data.timestamp_submitted,
-        tsReceived,
-        data.location_id,
-        data.location,
-        data.activity_id,
-        data.activity,
-        data.interaction,
-        otherPerson,
-        data.edited ? 1 : 0,
-        data.config_version
+      const { rows: savedRows } = await client.query(
+        `INSERT INTO annotations (
+           client_uuid, session_id, participant, seq,
+           timestamp_started, timestamp_submitted, timestamp_received,
+           location_id, location, activity_id, activity,
+           interaction, other_person, edited, config_version
+         ) VALUES (
+           $1, $2, $3, $4,
+           $5, $6, $7,
+           $8, $9, $10, $11,
+           $12, $13, $14, $15
+         )
+         RETURNING *`,
+        [
+          data.client_uuid,
+          data.session_id,
+          data.participant,
+          nextSeq,
+          data.timestamp_started,
+          data.timestamp_submitted,
+          tsReceived,
+          data.location_id,
+          data.location,
+          data.activity_id,
+          data.activity,
+          data.interaction,
+          otherPerson,
+          data.edited ? 1 : 0,
+          data.config_version
+        ]
       );
 
-      const saved = stmtGetAnnotationByClientUuid.get(data.client_uuid);
-      db.exec('COMMIT');
-      return { row: saved, isDuplicate: false };
+      await client.query('COMMIT');
+      return { row: savedRows[0], isDuplicate: false };
     } catch (err) {
-      try {
-        db.exec('ROLLBACK');
-      } catch {
-        // Already rolled back
-      }
+      await client.query('ROLLBACK').catch(() => {});
       throw err;
+    } finally {
+      client.release();
     }
   },
-  getAnnotations(sessionId, participant = null) {
+
+  async getAnnotations(sessionId, participant = null) {
+    await ensureInitialized();
     if (participant) {
-      return stmtGetAnnotationsForParticipant.all(sessionId, participant);
+      const { rows } = await pool.query(
+        `SELECT * FROM annotations
+         WHERE session_id = $1 AND participant = $2
+         ORDER BY timestamp_submitted ASC`,
+        [sessionId, participant]
+      );
+      return rows;
     }
-    return stmtGetAnnotationsForSession.all(sessionId);
+    const { rows } = await pool.query(
+      `SELECT * FROM annotations
+       WHERE session_id = $1
+       ORDER BY timestamp_submitted ASC, participant ASC`,
+      [sessionId]
+    );
+    return rows;
   },
-  saveSensorChunk(chunk) {
-    stmtInsertChunk.run(
-      chunk.chunk_uuid,
-      chunk.session_id,
-      chunk.participant,
-      chunk.device_id || null,
-      chunk.stream_type,
-      chunk.sample_count,
-      chunk.ts_first_device || null,
-      chunk.ts_last_device || null,
-      chunk.ts_received || new Date().toISOString(),
-      typeof chunk.payload === 'string' ? chunk.payload : JSON.stringify(chunk.payload)
+
+  async saveSensorChunk(chunk) {
+    await ensureInitialized();
+    await pool.query(
+      `INSERT INTO sensor_chunks (
+         chunk_uuid, session_id, participant, device_id,
+         stream_type, sample_count, ts_first_device, ts_last_device,
+         ts_received, payload
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       ON CONFLICT (chunk_uuid) DO NOTHING`,
+      [
+        chunk.chunk_uuid,
+        chunk.session_id,
+        chunk.participant,
+        chunk.device_id || null,
+        chunk.stream_type,
+        chunk.sample_count,
+        chunk.ts_first_device || null,
+        chunk.ts_last_device || null,
+        chunk.ts_received || new Date().toISOString(),
+        typeof chunk.payload === 'string' ? chunk.payload : JSON.stringify(chunk.payload)
+      ]
     );
   },
-  updateWearableStatus(device) {
-    stmtUpsertWearable.run(
-      device.device_id,
-      device.session_id || null,
-      device.participant || null,
-      device.device_name || 'Smartwatch',
-      device.device_family || 'polar',
-      device.battery_level ?? 100,
-      new Date().toISOString(),
-      device.status || 'connected'
+
+  async updateWearableStatus(device) {
+    await ensureInitialized();
+    await pool.query(
+      `INSERT INTO wearables (device_id, session_id, participant, device_name, device_family, battery_level, last_seen, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (device_id) DO UPDATE SET
+         session_id = EXCLUDED.session_id,
+         participant = EXCLUDED.participant,
+         device_name = EXCLUDED.device_name,
+         battery_level = EXCLUDED.battery_level,
+         last_seen = EXCLUDED.last_seen,
+         status = EXCLUDED.status`,
+      [
+        device.device_id,
+        device.session_id || null,
+        device.participant || null,
+        device.device_name || 'Smartwatch',
+        device.device_family || 'polar',
+        device.battery_level ?? 100,
+        new Date().toISOString(),
+        device.status || 'connected'
+      ]
     );
   },
-  listWearables() {
-    return stmtListWearables.all();
+
+  async listWearables() {
+    await ensureInitialized();
+    const { rows } = await pool.query('SELECT * FROM wearables ORDER BY last_seen DESC');
+    return rows;
   }
 };

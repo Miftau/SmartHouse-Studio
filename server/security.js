@@ -53,6 +53,18 @@ function parseCookies(cookieHeader) {
 // 2. SECURITY HEADERS & CORS ALLOWLIST MIDDLEWARE
 // ==========================================================================
 
+function getNeonAuthCspSources() {
+  const sources = ['https://*.neon.tech'];
+  if (process.env.NEON_AUTH_BASE_URL) {
+    try {
+      sources.push(new URL(process.env.NEON_AUTH_BASE_URL).origin);
+    } catch {
+      // Ignore malformed optional URL
+    }
+  }
+  return Array.from(new Set(sources)).join(' ');
+}
+
 function securityHeadersMiddleware(req, res, next) {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
@@ -60,7 +72,7 @@ function securityHeadersMiddleware(req, res, next) {
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
   res.setHeader(
     'Content-Security-Policy',
-    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' http://localhost:* https://localhost:* http://127.0.0.1:* https://127.0.0.1:* http://192.168.*:* http://10.*:*; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+    `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' http://localhost:* https://localhost:* http://127.0.0.1:* https://127.0.0.1:* http://192.168.*:* http://10.*:* ${getNeonAuthCspSources()}; frame-ancestors 'none'; base-uri 'self'; form-action 'self'`
   );
   if (req.secure || req.headers['x-forwarded-proto'] === 'https') {
     res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');

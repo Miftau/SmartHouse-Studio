@@ -9,6 +9,7 @@ import type {
   EnvironmentItem,
   EnvironmentDraftInput
 } from '../types';
+import { signOutNeonAuth } from './neonAuth';
 
 const API_BASE =
   import.meta.env.VITE_API_BASE ||
@@ -16,7 +17,13 @@ const API_BASE =
     ? 'http://localhost:3001/api'
     : '/api');
 
+const NEON_JWT_STORAGE_KEY = 'sh_neon_jwt';
+
 let participantToken: string | null = null;
+let adminBearerToken: string | null =
+  typeof window !== 'undefined'
+    ? window.sessionStorage.getItem(NEON_JWT_STORAGE_KEY)
+    : null;
 
 export function setParticipantToken(token: string | null): void {
   participantToken = token && token.trim() ? token.trim() : null;
@@ -26,10 +33,28 @@ export function getParticipantToken(): string | null {
   return participantToken;
 }
 
+export function setAdminBearerToken(token: string | null): void {
+  adminBearerToken = token && token.trim() ? token.trim() : null;
+  if (typeof window !== 'undefined') {
+    if (adminBearerToken) {
+      window.sessionStorage.setItem(NEON_JWT_STORAGE_KEY, adminBearerToken);
+    } else {
+      window.sessionStorage.removeItem(NEON_JWT_STORAGE_KEY);
+    }
+  }
+}
+
+export function getAdminBearerToken(): string | null {
+  return adminBearerToken;
+}
+
 async function apiFetch(path: string, options: RequestInit = {}): Promise<Response> {
   const headers = new Headers(options.headers || {});
   if (participantToken && !headers.has('X-Participant-Token')) {
     headers.set('X-Participant-Token', participantToken);
+  }
+  if (adminBearerToken && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${adminBearerToken}`);
   }
   return fetch(`${API_BASE}${path}`, {
     ...options,
@@ -50,6 +75,8 @@ export interface AuthState {
   role?: 'admin' | 'participant';
   username?: string;
   mustChangePassword?: boolean;
+  authProvider?: 'local' | 'neon-auth';
+  neonAuthEnabled?: boolean;
   session_id?: string;
   participant?: string;
 }
@@ -61,6 +88,7 @@ export async function fetchAuthMe(): Promise<AuthState> {
 }
 
 export async function loginAdmin(username: string, password: string): Promise<AuthState> {
+  setAdminBearerToken(null);
   const res = await apiFetch('/auth/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -71,6 +99,8 @@ export async function loginAdmin(username: string, password: string): Promise<Au
 }
 
 export async function logoutAdmin(): Promise<void> {
+  setAdminBearerToken(null);
+  await signOutNeonAuth();
   await apiFetch('/auth/logout', { method: 'POST' });
 }
 
