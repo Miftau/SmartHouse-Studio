@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { defineConfig } = require('@neon/config/v1');
 const { parseEnv } = require('@neon/env');
 
 const repoRoot = path.resolve(__dirname, '..');
@@ -12,20 +13,19 @@ for (const fileName of envFiles) {
   }
 }
 
-const neonConfigModule = require('../neon.ts');
-const neonConfig = neonConfigModule.default || neonConfigModule;
+const neonConfig = defineConfig({ auth: true });
 
-const parsed = parseEnv(neonConfig, [
-  'DATABASE_URL',
-  'DATABASE_URL_UNPOOLED',
-  'NEON_AUTH_BASE_URL',
-  'NEON_AUTH_JWKS_URL'
-]);
+const optionalKeys = ['DATABASE_URL_UNPOOLED', 'NEON_AUTH_BASE_URL', 'NEON_AUTH_JWKS_URL'].filter(
+  key => Boolean(process.env[key])
+);
+const keysToParse = ['DATABASE_URL', ...optionalKeys];
+
+const parsed = parseEnv(neonConfig, keysToParse);
 
 module.exports = {
   databaseUrl: parsed.postgres.databaseUrl,
-  databaseUrlUnpooled: parsed.postgres.databaseUrlUnpooled,
-  authBaseUrl: parsed.auth.baseUrl,
-  authJwksUrl: parsed.auth.jwksUrl,
+  databaseUrlUnpooled: parsed.postgres.databaseUrlUnpooled || parsed.postgres.databaseUrl,
+  authBaseUrl: parsed.auth?.baseUrl || '',
+  authJwksUrl: parsed.auth?.jwksUrl || '',
   branch: process.env.NEON_BRANCH || 'production'
 };
