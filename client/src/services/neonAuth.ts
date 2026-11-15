@@ -26,22 +26,22 @@ export async function getNeonAuthJwt(): Promise<string | null> {
   if (!authClient) return null;
   const res = await (authClient as NeonAuthClientWithToken).token();
   if (res?.error) {
-    throw new Error(res.error.message || 'Failed to obtain Neon Auth JWT');
+    throw new Error(res.error.message || 'Failed to obtain session token');
   }
   return res?.data?.token || null;
 }
 
 export async function signInWithNeonAuth(email: string, password: string): Promise<string> {
   if (!authClient) {
-    throw new Error('Neon Auth is not configured');
+    throw new Error('External authentication is not configured');
   }
   const res = await authClient.signIn.email({ email, password });
   if (res?.error) {
-    throw new Error(res.error.message || 'Neon Auth sign in failed');
+    throw new Error(res.error.message || 'Invalid username or password');
   }
   const token = await getNeonAuthJwt();
   if (!token) {
-    throw new Error('Signed in with Neon Auth, but no access token was returned');
+    throw new Error('Authentication succeeded, but no session token was returned');
   }
   return token;
 }
@@ -52,11 +52,11 @@ export async function signUpWithNeonAuth(
   name: string
 ): Promise<string> {
   if (!authClient) {
-    throw new Error('Neon Auth is not configured');
+    throw new Error('External authentication is not configured');
   }
   const res = await authClient.signUp.email({ email, password, name });
   if (res?.error) {
-    throw new Error(res.error.message || 'Neon Auth sign up failed');
+    throw new Error(res.error.message || 'Account creation failed');
   }
   const token = await getNeonAuthJwt();
   if (!token) {

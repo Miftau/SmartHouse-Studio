@@ -1,8 +1,8 @@
 import React, { useState } from 'react';
-import { ShieldCheck, Lock, User, Mail, Eye, EyeOff, KeyRound, AlertCircle } from 'lucide-react';
+import { ShieldCheck, Lock, User, Eye, EyeOff, KeyRound, AlertCircle } from 'lucide-react';
 import { loginAdmin, fetchAuthMe, setAdminBearerToken, changeAdminPassword } from '../services/api';
 import type { AuthState } from '../services/api';
-import { isNeonAuthAvailable, signInWithNeonAuth, signUpWithNeonAuth } from '../services/neonAuth';
+import { isNeonAuthAvailable, signInWithNeonAuth } from '../services/neonAuth';
 import { useNotify } from './InAppNotifications';
 
 interface AdminLoginProps {
@@ -11,12 +11,7 @@ interface AdminLoginProps {
 
 export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
   const { notify } = useNotify();
-  const neonAuthEnabled = isNeonAuthAvailable();
-  const [authMode, setAuthMode] = useState<'local' | 'neon-auth'>('local');
-  const [neonSubMode, setNeonSubMode] = useState<'signin' | 'signup'>('signin');
   const [username, setUsername] = useState('admin');
-  const [email, setEmail] = useState('');
-  const [displayName, setDisplayName] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -26,48 +21,35 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
     e.preventDefault();
     setErrorMsg(null);
 
-    if (authMode === 'local') {
-      if (!username.trim() || !password) {
-        setErrorMsg('Please enter both username and password.');
-        return;
-      }
-
-      setIsSubmitting(true);
-      try {
-        const auth = await loginAdmin(username.trim(), password);
-        notify(`Signed in as ${auth.username}.`, 'success', 'Admin Authenticated');
-        onLoginSuccess(auth);
-      } catch (err: any) {
-        const msg = err.message || 'Authentication failed';
-        setErrorMsg(msg);
-        notify(msg, 'error', 'Login Failed');
-      } finally {
-        setIsSubmitting(false);
-      }
-      return;
-    }
-
-    if (!email.trim() || !password) {
-      setErrorMsg('Please enter both email and password.');
+    const identifier = username.trim();
+    if (!identifier || !password) {
+      setErrorMsg('Please enter both username and password.');
       return;
     }
 
     setIsSubmitting(true);
     try {
-      const token =
-        neonSubMode === 'signup'
-          ? await signUpWithNeonAuth(email.trim(), password, displayName.trim() || email.trim())
-          : await signInWithNeonAuth(email.trim(), password);
-      setAdminBearerToken(token);
-      const auth = await fetchAuthMe();
-      if (!auth.authenticated || auth.role !== 'admin') {
-        setAdminBearerToken(null);
-        throw new Error('Neon Auth session could not be verified by the server.');
+      let auth: AuthState;
+      try {
+        auth = await loginAdmin(identifier, password);
+      } catch (localErr) {
+        if (!isNeonAuthAvailable() || !identifier.includes('@')) {
+          throw localErr;
+        }
+        const token = await signInWithNeonAuth(identifier, password);
+        setAdminBearerToken(token);
+        auth = await fetchAuthMe();
+        if (!auth.authenticated || auth.role !== 'admin') {
+          setAdminBearerToken(null);
+          throw new Error('Account session could not be verified.');
+        }
       }
-      notify(`Signed in with Neon Auth as ${auth.username}.`, 'success', 'Admin Authenticated');
+
+      notify(`Signed in as ${auth.username}.`, 'success', 'Admin Authenticated');
       onLoginSuccess(auth);
     } catch (err: any) {
-      const msg = err.message || 'Neon Auth authentication failed';
+      setAdminBearerToken(null);
+      const msg = err.message || 'Authentication failed';
       setErrorMsg(msg);
       notify(msg, 'error', 'Login Failed');
     } finally {
@@ -86,33 +68,6 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
           <p>Researcher Admin Console Sign In</p>
         </div>
 
-        {neonAuthEnabled && (
-          <div style={{ display: 'flex', gap: '8px', marginBottom: '16px' }}>
-            <button
-              type="button"
-              className={`btn-ui ${authMode === 'local' ? 'btn-ui-primary' : 'btn-ui-secondary'}`}
-              style={{ flex: 1 }}
-              onClick={() => {
-                setAuthMode('local');
-                setErrorMsg(null);
-              }}
-            >
-              Researcher Login
-            </button>
-            <button
-              type="button"
-              className={`btn-ui ${authMode === 'neon-auth' ? 'btn-ui-primary' : 'btn-ui-secondary'}`}
-              style={{ flex: 1 }}
-              onClick={() => {
-                setAuthMode('neon-auth');
-                setErrorMsg(null);
-              }}
-            >
-              Neon Auth
-            </button>
-          </div>
-        )}
-
         {errorMsg && (
           <div className="login-error-banner" role="alert">
             <AlertCircle size={16} />
@@ -121,84 +76,22 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
         )}
 
         <form onSubmit={handleSubmit} className="login-form">
-          {authMode === 'local' ? (
-            <div className="login-field">
-              <label htmlFor="admin-username">Researcher Username</label>
-              <div className="login-input-wrap">
-                <User size={16} className="login-input-icon" />
-                <input
-                  id="admin-username"
-                  type="text"
-                  autoComplete="username"
-                  className="ui-input login-input"
-                  value={username}
-                  onChange={e => setUsername(e.target.value)}
-                  placeholder="admin"
-                  required
-                />
-              </div>
+          <div className="login-field">
+            <label htmlFor="admin-username">Researcher Username or Email</label>
+            <div className="login-input-wrap">
+              <User size={16} className="login-input-icon" />
+              <input
+                id="admin-username"
+                type="text"
+                autoComplete="username"
+                className="ui-input login-input"
+                value={username}
+                onChange={e => setUsername(e.target.value)}
+                placeholder="admin"
+                required
+              />
             </div>
-          ) : (
-            <>
-              <div style={{ display: 'flex', gap: '8px', marginBottom: '4px' }}>
-                <button
-                  type="button"
-                  className={`btn-ui ${neonSubMode === 'signin' ? 'btn-ui-primary' : 'btn-ui-secondary'}`}
-                  style={{ flex: 1, fontSize: '0.85rem', padding: '6px 10px' }}
-                  onClick={() => {
-                    setNeonSubMode('signin');
-                    setErrorMsg(null);
-                  }}
-                >
-                  Sign In
-                </button>
-                <button
-                  type="button"
-                  className={`btn-ui ${neonSubMode === 'signup' ? 'btn-ui-primary' : 'btn-ui-secondary'}`}
-                  style={{ flex: 1, fontSize: '0.85rem', padding: '6px 10px' }}
-                  onClick={() => {
-                    setNeonSubMode('signup');
-                    setErrorMsg(null);
-                  }}
-                >
-                  Create Account
-                </button>
-              </div>
-              {neonSubMode === 'signup' && (
-                <div className="login-field">
-                  <label htmlFor="neon-name">Name</label>
-                  <div className="login-input-wrap">
-                    <User size={16} className="login-input-icon" />
-                    <input
-                      id="neon-name"
-                      type="text"
-                      autoComplete="name"
-                      className="ui-input login-input"
-                      value={displayName}
-                      onChange={e => setDisplayName(e.target.value)}
-                      placeholder="Researcher Name"
-                    />
-                  </div>
-                </div>
-              )}
-              <div className="login-field">
-                <label htmlFor="neon-email">Email</label>
-                <div className="login-input-wrap">
-                  <Mail size={16} className="login-input-icon" />
-                  <input
-                    id="neon-email"
-                    type="email"
-                    autoComplete="email"
-                    className="ui-input login-input"
-                    value={email}
-                    onChange={e => setEmail(e.target.value)}
-                    placeholder="researcher@example.com"
-                    required
-                  />
-                </div>
-              </div>
-            </>
-          )}
+          </div>
 
           <div className="login-field">
             <label htmlFor="admin-password">Password</label>
@@ -207,13 +100,13 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
               <input
                 id="admin-password"
                 type={showPassword ? 'text' : 'password'}
-                autoComplete={authMode === 'neon-auth' && neonSubMode === 'signup' ? 'new-password' : 'current-password'}
+                autoComplete="current-password"
                 className="ui-input login-input login-input-password"
                 value={password}
                 onChange={e => setPassword(e.target.value)}
                 placeholder="Enter password"
                 required
-                autoFocus={authMode === 'local'}
+                autoFocus
               />
               <button
                 type="button"
@@ -228,15 +121,7 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
 
           <button type="submit" className="btn-ui btn-ui-primary btn-full login-submit-btn" disabled={isSubmitting}>
             <ShieldCheck size={17} />
-            <span>
-              {isSubmitting
-                ? 'Verifying...'
-                : authMode === 'neon-auth'
-                  ? neonSubMode === 'signup'
-                    ? 'Create Account & Sign In'
-                    : 'Sign In with Neon Auth'
-                  : 'Sign In to Admin Console'}
-            </span>
+            <span>{isSubmitting ? 'Verifying...' : 'Sign In to Admin Console'}</span>
           </button>
         </form>
 

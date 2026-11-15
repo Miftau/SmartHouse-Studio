@@ -12,7 +12,7 @@ const {
   parseEnvironmentImportPayload
 } = require('./configPipeline');
 const db = require('./database');
-const { isNeonAuthConfigured, verifyNeonAuthToken } = require('./neonAuth');
+const { verifyNeonAuthToken } = require('./neonAuth');
 const { generateAnnotationsCsv } = require('./csvExport');
 const {
   TOKEN_TTL_MS,
@@ -128,6 +128,19 @@ async function resolveAdminAuth(req) {
   if (authHeader.toLowerCase().startsWith('bearer ')) {
     const token = authHeader.slice(7).trim();
     if (token) {
+      const sessionRow = await db.getAdminSession(hashToken(token));
+      if (sessionRow) {
+        const user = await db.getAdminUser(sessionRow.username);
+        if (user) {
+          return {
+            username: user.username,
+            mustChangePassword: Boolean(user.must_change_password),
+            rawSid: token,
+            authProvider: 'local'
+          };
+        }
+      }
+
       const verified = await verifyNeonAuthToken(token);
       if (verified) {
         return {
@@ -135,7 +148,7 @@ async function resolveAdminAuth(req) {
           userId: verified.userId,
           email: verified.email,
           mustChangePassword: false,
-          authProvider: 'neon-auth'
+          authProvider: 'external'
         };
       }
     }
@@ -234,7 +247,6 @@ app.get('/api/time', (req, res) => {
 
 app.get('/api/auth/me', async (req, res) => {
   try {
-    const neonAuthEnabled = isNeonAuthConfigured();
     const admin = await resolveAdminAuth(req);
     if (admin) {
       return res.json({
@@ -242,8 +254,7 @@ app.get('/api/auth/me', async (req, res) => {
         role: 'admin',
         username: admin.username,
         mustChangePassword: admin.mustChangePassword,
-        authProvider: admin.authProvider || 'local',
-        neonAuthEnabled
+        authProvider: admin.authProvider || 'local'
       });
     }
     const participantAuth = await resolveParticipantAuth(req);
@@ -252,11 +263,10 @@ app.get('/api/auth/me', async (req, res) => {
         authenticated: true,
         role: 'participant',
         session_id: participantAuth.session_id,
-        participant: participantAuth.participant,
-        neonAuthEnabled
+        participant: participantAuth.participant
       });
     }
-    return res.json({ authenticated: false, neonAuthEnabled });
+    return res.json({ authenticated: false });
   } catch (err) {
     safeServerError(res, err, 'Failed to check auth state');
   }
@@ -285,7 +295,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
       username: user.username,
       mustChangePassword: Boolean(user.must_change_password),
       authProvider: 'local',
-      neonAuthEnabled: isNeonAuthConfigured()
+      token: rawToken
     });
   } catch (err) {
     safeServerError(res, err, 'Login failed');
@@ -307,8 +317,8 @@ app.post('/api/auth/logout', async (req, res) => {
 
 app.post('/api/auth/change-password', requireAdmin, authLimiter, async (req, res) => {
   try {
-    if (req.adminAuth.authProvider === 'neon-auth') {
-      return res.status(400).json({ error: 'Password changes for Neon Auth accounts are managed by Neon Auth' });
+    if (req.adminAuth.authProvider !== 'local') {
+      return res.status(400).json({ error: 'Password changes are not available for externally managed accounts' });
     }
 
     const currentPassword = typeof req.body?.currentPassword === 'string' ? req.body.currentPassword : '';

@@ -11,18 +11,41 @@ import type {
 } from '../types';
 import { signOutNeonAuth } from './neonAuth';
 
-const API_BASE =
-  import.meta.env.VITE_API_BASE ||
-  (typeof window !== 'undefined' && window.location.port === '5173'
-    ? 'http://localhost:3001/api'
-    : '/api');
+const DEFAULT_REMOTE_API_BASE = 'https://smart-house-studio-ten.vercel.app/api';
 
-const NEON_JWT_STORAGE_KEY = 'sh_neon_jwt';
+function normalizeApiBase(raw: string): string {
+  const trimmed = raw.trim().replace(/\/+$/, '');
+  if (!trimmed) return '/api';
+  return trimmed.endsWith('/api') ? trimmed : `${trimmed}/api`;
+}
+
+function resolveApiBase(): string {
+  const configured = import.meta.env.VITE_API_BASE;
+  if (typeof configured === 'string' && configured.trim()) {
+    return normalizeApiBase(configured);
+  }
+  if (typeof window !== 'undefined') {
+    if (window.location.origin === 'https://smart-house-studio-ten.vercel.app') {
+      return '/api';
+    }
+    if (
+      (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') &&
+      window.location.port !== '5173'
+    ) {
+      return '/api';
+    }
+  }
+  return DEFAULT_REMOTE_API_BASE;
+}
+
+const API_BASE = resolveApiBase();
+
+const ADMIN_TOKEN_STORAGE_KEY = 'sh_admin_token';
 
 let participantToken: string | null = null;
 let adminBearerToken: string | null =
   typeof window !== 'undefined'
-    ? window.sessionStorage.getItem(NEON_JWT_STORAGE_KEY)
+    ? window.sessionStorage.getItem(ADMIN_TOKEN_STORAGE_KEY)
     : null;
 
 export function setParticipantToken(token: string | null): void {
@@ -37,9 +60,9 @@ export function setAdminBearerToken(token: string | null): void {
   adminBearerToken = token && token.trim() ? token.trim() : null;
   if (typeof window !== 'undefined') {
     if (adminBearerToken) {
-      window.sessionStorage.setItem(NEON_JWT_STORAGE_KEY, adminBearerToken);
+      window.sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, adminBearerToken);
     } else {
-      window.sessionStorage.removeItem(NEON_JWT_STORAGE_KEY);
+      window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
     }
   }
 }
@@ -75,8 +98,8 @@ export interface AuthState {
   role?: 'admin' | 'participant';
   username?: string;
   mustChangePassword?: boolean;
-  authProvider?: 'local' | 'neon-auth';
-  neonAuthEnabled?: boolean;
+  authProvider?: 'local' | 'external';
+  token?: string;
   session_id?: string;
   participant?: string;
 }
@@ -95,7 +118,11 @@ export async function loginAdmin(username: string, password: string): Promise<Au
     body: JSON.stringify({ username, password })
   });
   if (!res.ok) throw await parseError(res, 'Login failed');
-  return res.json();
+  const data: AuthState = await res.json();
+  if (data.token) {
+    setAdminBearerToken(data.token);
+  }
+  return data;
 }
 
 export async function logoutAdmin(): Promise<void> {
