@@ -1,14 +1,22 @@
-const { createRemoteJWKSet, jwtVerify } = require('jose');
 const neonEnv = require('./neonEnv');
 
+let joseModulePromise = null;
 let cachedJwks = null;
 let cachedIssuer = null;
 
-function getJwksAndIssuer() {
+async function getJose() {
+  if (!joseModulePromise) {
+    joseModulePromise = import('jose');
+  }
+  return joseModulePromise;
+}
+
+async function getJwksAndIssuer() {
   if (!neonEnv.authJwksUrl || !neonEnv.authBaseUrl) {
     return null;
   }
   if (!cachedJwks) {
+    const { createRemoteJWKSet } = await getJose();
     cachedJwks = createRemoteJWKSet(new URL(neonEnv.authJwksUrl));
     cachedIssuer = new URL(neonEnv.authBaseUrl).origin;
   }
@@ -21,10 +29,11 @@ function isNeonAuthConfigured() {
 
 async function verifyNeonAuthToken(rawToken) {
   if (!rawToken || typeof rawToken !== 'string') return null;
-  const ctx = getJwksAndIssuer();
+  const ctx = await getJwksAndIssuer();
   if (!ctx) return null;
 
   try {
+    const { jwtVerify } = await getJose();
     const { payload } = await jwtVerify(rawToken.trim(), ctx.jwks, {
       issuer: ctx.issuer
     });

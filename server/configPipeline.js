@@ -2,8 +2,31 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-// Configuration directory is the parent directory where json files are located
-const CONFIG_DIR = path.resolve(__dirname, '..');
+// Prefer root config dir locally when present, falling back to bundled server/config for serverless deploys
+const ROOT_CONFIG_DIR = path.resolve(__dirname, '..');
+const BUNDLED_CONFIG_DIR = path.join(__dirname, 'config');
+const BUNDLED_CONFIG_FILES = {
+  'scenario.json': path.join(__dirname, 'config', 'scenario.json'),
+  'locations.json': path.join(__dirname, 'config', 'locations.json'),
+  'activities.json': path.join(__dirname, 'config', 'activities.json'),
+  'activities_location.json': path.join(__dirname, 'config', 'activities_location.json'),
+  'sensors.json': path.join(__dirname, 'config', 'sensors.json')
+};
+const CONFIG_DIR = fs.existsSync(path.join(ROOT_CONFIG_DIR, 'scenario.json'))
+  ? ROOT_CONFIG_DIR
+  : BUNDLED_CONFIG_DIR;
+
+function resolveConfigFilePath(filename) {
+  const rootPath = path.join(ROOT_CONFIG_DIR, filename);
+  if (fs.existsSync(rootPath)) {
+    return rootPath;
+  }
+  const bundled = BUNDLED_CONFIG_FILES[filename];
+  if (bundled && fs.existsSync(bundled)) {
+    return bundled;
+  }
+  return path.join(CONFIG_DIR, filename);
+}
 
 // Helper to safely parse JSON tolerating trailing commas & comments
 function tolerantJsonParse(rawText, filename) {
@@ -96,11 +119,11 @@ function loadAndValidateConfig() {
   const warnings = [];
   const errors = [];
 
-  const scenarioPath = path.join(CONFIG_DIR, 'scenario.json');
-  const locationsPath = path.join(CONFIG_DIR, 'locations.json');
-  const activitiesPath = path.join(CONFIG_DIR, 'activities.json');
-  const actLocPath = path.join(CONFIG_DIR, 'activities_location.json');
-  const sensorsPath = path.join(CONFIG_DIR, 'sensors.json');
+  const scenarioPath = resolveConfigFilePath('scenario.json');
+  const locationsPath = resolveConfigFilePath('locations.json');
+  const activitiesPath = resolveConfigFilePath('activities.json');
+  const actLocPath = resolveConfigFilePath('activities_location.json');
+  const sensorsPath = resolveConfigFilePath('sensors.json');
 
   let rawScenario, rawLocations, rawActivities, rawActLoc, rawSensors;
 

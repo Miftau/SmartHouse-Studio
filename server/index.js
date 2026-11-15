@@ -215,8 +215,8 @@ function clearAdminCookie(req, res) {
 
 function safeServerError(res, err, publicMessage = 'Internal server error') {
   console.error('[Server Error]', err);
-  if (err && err.statusCode && err.statusCode >= 400 && err.statusCode < 500) {
-    return res.status(err.statusCode).json({ error: err.message });
+  if (err && ((err.statusCode >= 400 && err.statusCode < 500) || err.expose)) {
+    return res.status(err.statusCode || 500).json({ error: err.message });
   }
   return res.status(500).json({ error: publicMessage });
 }
@@ -947,9 +947,15 @@ app.get('/api/sessions/:id/export.csv', requireAdmin, async (req, res) => {
   }
 });
 
-// Serve frontend static build if present
-const clientDist = path.join(__dirname, '..', 'client', 'dist');
-if (fs.existsSync(clientDist)) {
+// Serve frontend static build if present (prefer ../client/dist locally, fall back to bundled ./public)
+const clientDistLocal = path.join(__dirname, '..', 'client', 'dist');
+const clientDistBundled = path.join(__dirname, 'public');
+const clientDist = fs.existsSync(path.join(__dirname, '..', 'client', 'dist', 'index.html'))
+  ? clientDistLocal
+  : fs.existsSync(path.join(__dirname, 'public', 'index.html'))
+    ? clientDistBundled
+    : null;
+if (clientDist) {
   app.use(express.static(clientDist));
   app.use((req, res) => {
     res.sendFile(path.join(clientDist, 'index.html'));
@@ -970,20 +976,24 @@ app.use((err, req, res, _next) => {
   return safeServerError(res, err);
 });
 
-// Optional HTTPS/TLS listener when SSL_CERT_PATH & SSL_KEY_PATH are provided
-const certPath = process.env.SSL_CERT_PATH;
-const keyPath = process.env.SSL_KEY_PATH;
+if (!process.env.VERCEL) {
+  // Optional HTTPS/TLS listener when SSL_CERT_PATH & SSL_KEY_PATH are provided
+  const certPath = process.env.SSL_CERT_PATH;
+  const keyPath = process.env.SSL_KEY_PATH;
 
-if (certPath && keyPath && fs.existsSync(certPath) && fs.existsSync(keyPath)) {
-  const tlsOpts = {
-    cert: fs.readFileSync(certPath),
-    key: fs.readFileSync(keyPath)
-  };
-  https.createServer(tlsOpts, app).listen(PORT, '0.0.0.0', () => {
-    console.log(`[SmartHouse Server] HTTPS API running on https://localhost:${PORT}`);
-  });
-} else {
-  http.createServer(app).listen(PORT, '0.0.0.0', () => {
-    console.log(`[SmartHouse Server] API running on http://localhost:${PORT}`);
-  });
+  if (certPath && keyPath && fs.existsSync(certPath) && fs.existsSync(keyPath)) {
+    const tlsOpts = {
+      cert: fs.readFileSync(certPath),
+      key: fs.readFileSync(keyPath)
+    };
+    https.createServer(tlsOpts, app).listen(PORT, '0.0.0.0', () => {
+      console.log(`[SmartHouse Server] HTTPS API running on https://localhost:${PORT}`);
+    });
+  } else {
+    http.createServer(app).listen(PORT, '0.0.0.0', () => {
+      console.log(`[SmartHouse Server] API running on http://localhost:${PORT}`);
+    });
+  }
 }
+
+module.exports = app;

@@ -107,6 +107,16 @@ function createAllowedOriginsSet(port, extraOrigins = []) {
   if (process.env.RENDER_EXTERNAL_HOSTNAME) {
     origins.add(`https://${process.env.RENDER_EXTERNAL_HOSTNAME}`);
   }
+  for (const vercelHost of [
+    process.env.VERCEL_URL,
+    process.env.VERCEL_BRANCH_URL,
+    process.env.VERCEL_PROJECT_PRODUCTION_URL
+  ]) {
+    if (vercelHost) {
+      const normalized = vercelHost.replace(/^https?:\/\//, '').replace(/\/$/, '');
+      if (normalized) origins.add(`https://${normalized}`);
+    }
+  }
 
   for (const o of extraOrigins) {
     if (o && o.trim()) origins.add(o.trim());
@@ -124,6 +134,7 @@ function createCorsOptions(port) {
       // Allow same-origin / server-to-server / curl (no Origin header)
       if (!origin) return callback(null, true);
       if (allowed.has(origin)) return callback(null, true);
+      if (/^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin)) return callback(null, true);
       return callback(new Error('CORS policy: Origin not allowed'));
     },
     credentials: true

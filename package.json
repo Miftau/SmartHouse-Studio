@@ -10,8 +10,9 @@
     "dev:server": "node server/index.js",
     "dev:client": "cd client && npm run dev",
     "db:migrate": "node server/migrate.js",
-    "build:client": "npm --prefix client install --include=dev && npm --prefix client run build",
-    "build": "npm --prefix server install && npm --prefix client install --include=dev && npm --prefix client run build"
+    "sync:assets": "node -e \"const fs=require('fs'),p=require('path');fs.mkdirSync('server/config',{recursive:true});for(const f of ['scenario.json','locations.json','activities.json','activities_location.json','sensors.json'])fs.copyFileSync(f,p.join('server/config',f));fs.rmSync('server/public',{recursive:true,force:true});fs.cpSync('client/dist','server/public',{recursive:true});\"",
+    "build:client": "npm --prefix client install --include=dev && npm --prefix client run build && npm run sync:assets",
+    "build": "npm --prefix server install && npm run build:client"
   },
   "keywords": [
     "smart-house",

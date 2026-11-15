@@ -3,14 +3,47 @@ const neonEnv = require('./neonEnv');
 const { runMigrations } = require('./migrate');
 const { hashPassword, generateToken } = require('./security');
 
-const pool = new Pool({
-  connectionString: neonEnv.databaseUrl,
-  allowExitOnIdle: true
-});
+let poolInstance = null;
+
+function createMissingDbConfigError() {
+  const err = new Error(
+    'Database connection is not configured. Set DATABASE_URL in your environment.'
+  );
+  err.statusCode = 503;
+  err.expose = true;
+  return err;
+}
+
+function getPool() {
+  if (!neonEnv.databaseUrl) {
+    throw createMissingDbConfigError();
+  }
+  if (!poolInstance) {
+    poolInstance = new Pool({
+      connectionString: neonEnv.databaseUrl,
+      allowExitOnIdle: true
+    });
+  }
+  return poolInstance;
+}
+
+const pool = {
+  query: (...args) => getPool().query(...args),
+  connect: (...args) => getPool().connect(...args),
+  end: (...args) => {
+    if (!poolInstance) return Promise.resolve();
+    const current = poolInstance;
+    poolInstance = null;
+    return current.end(...args);
+  }
+};
 
 let initPromise = null;
 
 async function ensureInitialized() {
+  if (!neonEnv.databaseUrl) {
+    throw createMissingDbConfigError();
+  }
   if (!initPromise) {
     initPromise = (async () => {
       await runMigrations();
